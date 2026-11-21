@@ -10,7 +10,7 @@ import ErrorBoundary from "@components/ErrorBoundary";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType } from "@utils/types";
 import { findStoreLazy } from "@webpack";
-import { ChannelStore, FluxDispatcher, Menu, React, RelationshipStore, UserStore } from "@webpack/common";
+import { ChannelStore, FluxDispatcher, Menu, PresenceStore, React, RelationshipStore, UserStore } from "@webpack/common";
 
 import managedStyle from "./style.css?managed";
 
@@ -18,10 +18,13 @@ const logger = new Logger("HideFriends");
 
 /** Found when first used, not when the file loads (Discord's stores don't exist yet at that point) */
 const FriendsStore = findStoreLazy("FriendsStore");
+/** Builds the cards of the "Active Now" panel, on the right of the Friends page */
+const NowPlayingViewStore = findStoreLazy("NowPlayingViewStore");
 
-/** Discord's numbers: relationship type 1 = friend, channel type 1 = one-to-one DM */
+/** Discord's numbers: relationship type 1 = friend, channel type 1 = one-to-one DM, activity type 4 = custom status */
 const FRIEND = 1;
 const DM = 1;
+const CUSTOM_STATUS = 4;
 
 /** Id of the "Hidden" tab in the Friends page (Discord's own tabs are ONLINE, ALL, PENDING...) */
 const HIDDEN_SECTION = "HIDDEN_FRIENDS";
@@ -39,6 +42,12 @@ const settings = definePluginSettings({
     hideFromDmList: {
         type: OptionType.BOOLEAN,
         description: "Hide the direct message conversations of hidden friends from the DM list",
+        default: true,
+        onChange: () => refreshLists()
+    },
+    hideFromActiveNow: {
+        type: OptionType.BOOLEAN,
+        description: "Hide hidden friends from the Active Now panel, on the right of the Friends page",
         default: true,
         onChange: () => refreshLists()
     },
@@ -93,14 +102,143 @@ function leaveHiddenTab() {
 
 let forceUpdateDmList: (() => void) | undefined;
 
-/** Makes Discord redraw the Friends list and the DM list right away */
+/** Makes Discord redraw the Friends list, the DM list and Active Now right away */
 function refreshLists() {
     try {
         RelationshipStore?.emitChange?.();
     } catch (e) {
         logger.error("Could not refresh the Friends list", e);
     }
+    try {
+        NowPlayingViewStore?.emitChange?.();
+    } catch (e) {
+        logger.error("Could not refresh Active Now", e);
+    }
     forceUpdateDmList?.();
+}
+
+type MaybeUser = { id?: string; } | null | undefined;
+
+function asList(value: unknown): any[] {
+    return Array.isArray(value) ? value : [];
+}
+
+/** Same game or app (Spotify and other activities without an application id are compared by type and name) */
+function sameApp(a: any, b: any) {
+    if (a?.application_id || b?.application_id) return a?.application_id === b?.application_id;
+    return a?.type === b?.type && a?.name === b?.name;
+}
+
+/**
+ * Active Now shows one activity per game on a card, with the details of whoever comes first.
+ * When that was a hidden friend, this looks for a visible friend whose own activity is the same game
+ * (their main activity, the one Discord would have used for them).
+ */
+function findVisibleActivity(activity: any, candidates: MaybeUser[]) {
+    if (activity == null) return null;
+    for (const user of candidates) {
+        if (!user?.id) continue;
+        const own = asList(PresenceStore.getActivities(user.id)).find(a => a != null && a.type !== CUSTOM_STATUS);
+        if (own && sameApp(own, activity)) {
+            return { activity: own, activityUser: user, startedPlayingTime: own.timestamps?.start ?? own.created_at };
+        }
+    }
+    return null;
+}
+
+/**
+ * One Active Now card ("party"): removes hidden friends from it.
+ * Returns the same party when no hidden friend is on it, a cleaned copy,
+ * or null when the card should go (it was only about hidden friends, or nothing would be left on it).
+ */
+function cleanActiveNowParty(party: any, hidden: HiddenUsers): any {
+    const isHiddenUser = (user: MaybeUser) => !!user?.id && Object.hasOwn(hidden, user.id);
+
+    const priority = asList(party.priorityMembers);
+    const partied = asList(party.partiedMembers);
+    const voice = asList(party.voiceChannels);
+    const activities = asList(party.currentActivities);
+    const streams = asList(party.applicationStreams);
+
+    const involved = priority.some(m => isHiddenUser(m?.user))
+        || partied.some(isHiddenUser)
+        || voice.some(vc => asList(vc?.members).some(isHiddenUser))
+        || activities.some(a => isHiddenUser(a?.activityUser) || asList(a?.playingMembers).some(isHiddenUser))
+        || streams.some(s => isHiddenUser(s?.streamUser));
+    if (!involved) return party;
+
+    // The friends the card is about (avatar and names at its top). Only hidden friends: the card goes
+    const priorityMembers = priority.filter(m => !isHiddenUser(m?.user));
+    if (!priorityMembers.length) return null;
+
+    const voiceChannels = voice
+        .map(vc => {
+            const members = asList(vc?.members);
+            const visible = members.filter(u => !isHiddenUser(u));
+            return visible.length === members.length ? vc : { ...vc, members: visible };
+        })
+        .filter(vc => asList(vc?.members).length > 0);
+
+    const currentActivities: any[] = [];
+    for (const entry of activities) {
+        const members = asList(entry?.playingMembers);
+        const playingMembers = members.filter(u => !isHiddenUser(u));
+        if (!isHiddenUser(entry?.activityUser)) {
+            currentActivities.push(playingMembers.length === members.length ? entry : { ...entry, playingMembers });
+            continue;
+        }
+        // The game was shown with the hidden friend's details: keep it only if a visible friend of the card plays it too
+        const swap = findVisibleActivity(entry?.activity, priorityMembers.map(m => m?.user));
+        if (swap) currentActivities.push({ ...entry, ...swap, playingMembers });
+    }
+
+    const applicationStreams = streams.filter(s => !isHiddenUser(s?.streamUser));
+
+    // Same rule as Discord: a card needs a voice channel, an activity or a stream to be shown
+    if (!voiceChannels.length && !currentActivities.length && !applicationStreams.length) return null;
+
+    return {
+        ...party,
+        priorityMembers,
+        partiedMembers: partied.filter(u => !isHiddenUser(u)),
+        voiceChannels,
+        currentActivities,
+        applicationStreams
+    };
+}
+
+/** Last Active Now result, given back as long as nothing changed (so Discord doesn't redraw for nothing) */
+let activeNowCache: { cards: unknown; key: string; result: unknown; } | undefined;
+
+function filterActiveNow(cards: unknown) {
+    try {
+        if (!Array.isArray(cards)) return cards;
+        const hidden: HiddenUsers = settings.store.hideFromActiveNow ? getHidden() : {};
+        const key = Object.keys(hidden).join(",");
+        if (activeNowCache?.cards === cards && activeNowCache.key === key) return activeNowCache.result;
+
+        let result: unknown[] = cards;
+        if (key) {
+            const kept: unknown[] = [];
+            for (const card of cards) {
+                const party = card?.party;
+                if (party == null || typeof party !== "object") {
+                    kept.push(card);
+                    continue;
+                }
+                const cleaned = cleanActiveNowParty(party, hidden);
+                if (cleaned === null) continue;
+                kept.push(cleaned === party ? card : { ...card, party: cleaned });
+            }
+            if (kept.length !== cards.length || kept.some((card, i) => card !== cards[i])) result = kept;
+        }
+
+        activeNowCache = { cards, key, result };
+        return result;
+    } catch (e) {
+        logger.error("Active Now filter failed", e);
+        return cards;
+    }
 }
 
 function setHidden(userId: string, hidden: boolean) {
@@ -190,7 +328,7 @@ const userMenuPatch: NavContextMenuPatchCallback = (children, props) => {
 
 export default definePlugin({
     name: "HideFriends",
-    description: "Hide chosen friends from your Friends list and DM list. Right-click a friend and choose \"Hide friend\". Hidden friends are listed in a \"Hidden\" tab of the Friends page, where a right-click > \"Unhide friend\" brings them back.",
+    description: "Hide chosen friends from your Friends list, DM list and Active Now. Right-click a friend and choose \"Hide friend\". Hidden friends are listed in a \"Hidden\" tab of the Friends page, where a right-click > \"Unhide friend\" brings them back.",
     authors: [{ name: "TheUnknownMurda", id: 338163169782398977n }],
     tags: ["Friends", "Organisation"],
     settings,
@@ -261,6 +399,15 @@ export default definePlugin({
                 match: /let{showLibrary:\i,/,
                 replace: "$self.useDmListUpdater();$&"
             }
+        },
+        // Active Now panel (right of the Friends page): its list of cards goes through filterActiveNow.
+        // The built-in ShowHiddenChannels patches another spot of the same store, both work together.
+        {
+            find: '"NowPlayingViewStore"',
+            replacement: {
+                match: /(?<=get nowPlayingCards\(\)\{return )\i(?=\})/,
+                replace: "$self.filterActiveNow($&)"
+            }
         }
     ],
 
@@ -305,6 +452,8 @@ export default definePlugin({
             return channelIds;
         }
     },
+
+    filterActiveNow,
 
     useDmListUpdater() {
         const [, setTick] = React.useState(0);
